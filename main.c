@@ -43,12 +43,41 @@ struct dev_priv
 	struct list_head waiters;
 	struct list_head active_list;
 };
-
+struct virtual_dev_t;
 struct slot_info_t
 {
-	struct task_struct *user;
+	struct virtual_dev_t *user;
 	int status;
 	struct dev_priv *actual_dev;
+};
+// Contains information about the device session.
+// This structure is linked to the file descriptor and thus to the session.
+#define DEV_STATUS_BLANK 		0
+// user thread changes to QUEUED
+#define DEV_STATUS_QUEUED 		1
+/*
+ * Slot connection is ready!!!
+ * kthread changes to operating
+ */
+#define DEV_STATUS_OPERATING	2
+// kthread or user thread changes state to releasing or closing
+#define DEV_STATUS_RELEASING	3
+#define DEV_STATUS_CLOSING		4
+struct virtual_dev_t
+{
+	// virtual device status
+	int status;
+	struct spinlock status_lock;
+	// Given slot
+	struct slot_info_t *slot;
+	// linked list for enqueueing
+	struct list_head waiter_list;
+	// wait point for status "operating"
+	struct completion compl;
+	// for debugging
+	struct task_struct *user;
+	// deleting flag
+	int marked_for_death;
 };
 
 #define EVENT_REQUEST 	1
@@ -58,19 +87,18 @@ struct user_event
 	int event_type;
 	// sender process
 	struct task_struct *sender;
-	// wait point for event handling
-	struct  completion compl;
 	// list element for listing
 	struct list_head waiter_list;
-	// event timestamp
-	struct timespec time_stamp;
-	// return value, scheduler sets
-	int slot_id;
-
 	// request specific values
 	int acc_id;
+	// corresponding virtual device
+	struct virtual_dev_t *vdev;
 };
 
+
+/**
+ * lock policy: only kthread can get more than one spin lock, other threads may only get 1!
+ */
 // global variables
 #define SLOT_NUM 1 // TODO CORE gather it form device tree
 
@@ -113,6 +141,22 @@ static void add_event(struct user_event *e)
 }
 
 
+static struct user_event* get_event(void)
+{
+	struct user_event *ue;
+	spin_lock(&(event_list_lock));
+	if(list_empty(&event_list))
+		ue = NULL;
+	else
+	{
+		ue = list_entry(event_list.next,struct user_event, waiter_list);
+		// remove event from the queue
+		list_del_init(&(ue->waiter_list));
+	}
+	spin_unlock(&(event_list_lock));
+	return ue;
+}
+
 static int program_slot(int acc_id)
 {
 	static char name[100];
@@ -123,7 +167,7 @@ static int program_slot(int acc_id)
 static void hw_schedule(void)
 {
 	int i,j;
-	struct user_event *r = NULL;
+	struct virtual_dev_t *vdev;
 	struct dev_priv *d = NULL;
 
 	spin_lock(&slot_lock);
@@ -140,60 +184,69 @@ static void hw_schedule(void)
 			// try actual dev
 			if(slot_info[i].actual_dev && !list_empty(&(slot_info[i].actual_dev->waiters)))
 			{
-					r = list_entry(slot_info[i].actual_dev->waiters.next,struct user_event,waiter_list);
+					vdev = list_entry(slot_info[i].actual_dev->waiters.next,struct virtual_dev_t,waiter_list);
 					d = slot_info[i].actual_dev;
 
-					list_del(&(r->waiter_list));
+					list_del_init(&(vdev->waiter_list));
 					spin_lock(&slot_lock);
 					slot_info[i].status = SLOT_USED;
-					slot_info[i].user = r->sender;
+					slot_info[i].user = vdev;
+					vdev->slot = &slot_info[i];
 					free_slot_num--;
 					spin_unlock(&slot_lock);
 
-					r->slot_id = i;
-					pr_info("Starting process %d for slot: %d, with accel: %d.\n",r->sender->pid,r->slot_id,r->acc_id);
-					complete(&(r->compl));
+					spin_lock(&(vdev->status_lock));
+					vdev->status = DEV_STATUS_OPERATING;
+					spin_unlock(&(vdev->status_lock));
+					pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user->pid,i,slot_info[i].actual_dev->acc_id);
+					complete(&(vdev->compl));
 			}
 			else
 			{
-				r = NULL;
+				vdev = NULL;
 				// look for other requests
 				for(j=0;j<device_num;j++)
 					if(!list_empty(&(device_data[j].waiters)))
 					{
-						r = list_entry(device_data[j].waiters.next,struct user_event,waiter_list);
+						vdev = list_entry(device_data[j].waiters.next,struct virtual_dev_t,waiter_list);
 						d = &device_data[j];
 						break;
 					}
 
 				// serve selected request
-				if(r)
+				if(vdev)
 				{
 
-					list_del(&(r->waiter_list));
+					list_del_init(&(vdev->waiter_list));
 
 					// start slot programming
-					if(!program_slot(r->acc_id))
+					if(!program_slot(d->acc_id))
 					{
 						// programming succeeded
 						spin_lock(&slot_lock);
 						slot_info[i].status = SLOT_USED;
 						slot_info[i].actual_dev = d;
-						slot_info[i].user = r->sender;
+						slot_info[i].user = vdev;
 						free_slot_num--;
 						spin_unlock(&slot_lock);
 
-						r->slot_id = i;
+						spin_lock(&(vdev->status_lock));
+						vdev->status = DEV_STATUS_OPERATING;
+						vdev->slot = &slot_info[i];
+						spin_unlock(&(vdev->status_lock));
 					}
 					else
 					{
 						// programming failed
-						r->slot_id = -1;
+						spin_lock(&(vdev->status_lock));
+						vdev->status = DEV_STATUS_BLANK;
+						vdev->slot = NULL;
+						spin_unlock(&(vdev->status_lock));
 					}
 
 					// start waiter process
-					pr_info("Starting process %d for slot: %d, with accel: %d.\n",r->sender->pid,r->slot_id,r->acc_id);
-					complete(&(r->compl));
+					pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user->pid,i,d->acc_id);
+					complete(&(vdev->compl));
 				}
 			}
 			spin_lock(&slot_lock);
@@ -211,51 +264,76 @@ static int sched_thread_fn(void *data)
 	while(!quit)
 	{
 		struct user_event *r = NULL;
+		struct virtual_dev_t *vdev = NULL;
 		int acc_id;
-		int i;
 
-		spin_lock(&event_list_lock);
-		while(!list_empty(&event_list))
+		while((r = get_event()) != NULL)
 			{
-				r = list_entry(event_list.next,struct user_event, waiter_list);
-				list_del_init(&(r->waiter_list));
-
-				spin_unlock(&event_list_lock);
 				pr_info("Processing user event: type: %d, accel_num: %d.\n",r->event_type,r->acc_id);
 
+				vdev = r->vdev;
 				switch(r->event_type)
 				{
-				case EVENT_REQUEST:
-					// TODO SAFETY deadlock check
-					acc_id = r->acc_id;
-					list_add_tail(&(r->waiter_list),&(device_data[acc_id].waiters));
-					break;
-				case EVENT_CLOSE:
-					// freeing up used slots
-					spin_lock(&slot_lock);
-					for(i=0;i<SLOT_NUM;i++)
+					case EVENT_REQUEST:
 					{
-						if(slot_info[i].user == r->sender)
-						{
-							slot_info[i].status = SLOT_FREE;
-							slot_info[i].user = NULL;
-							free_slot_num++;
-							spin_unlock(&slot_lock);
-							pr_warn("Freeing accelerator in slot %d.\n",i);
-							spin_lock(&slot_lock);
-						}
-					}
-					spin_unlock(&slot_lock);
-					kfree(r);
-					break;
-				default:
-					pr_err("Unknown event type. This might cause memory leak.\n");
-					break;
-				}
+						acc_id = r->acc_id;
+						// add virtual device to the waiting queue
+						list_add_tail(&(vdev->waiter_list),&(device_data[acc_id].waiters));
 
-				spin_lock(&event_list_lock);
-			}
-		spin_unlock(&event_list_lock);
+						// free event
+						kfree(r);
+						r=NULL;
+
+						break;
+					}
+					case EVENT_CLOSE:
+					{
+						// EVENT_CLOSE is generated when the hw file is closed
+						int status;
+						struct slot_info_t *slot;
+
+						// if the status is releasing, wait for the user process thread to finish the releasing
+						do
+						{
+							spin_lock(&(vdev->status_lock));
+							status = vdev->status;
+							if(status != DEV_STATUS_RELEASING) vdev->status = DEV_STATUS_CLOSING;
+							spin_unlock(&(vdev->status_lock));
+							if(status == DEV_STATUS_RELEASING) msleep(1);
+						}while(status==DEV_STATUS_RELEASING);
+
+						// close the virtual device according to the status
+						switch(status)
+						{
+						case DEV_STATUS_BLANK:
+							kfree(vdev);
+							break;
+						case DEV_STATUS_QUEUED:
+							list_del(&(vdev->waiter_list));
+							kfree(vdev);
+							break;
+						case DEV_STATUS_OPERATING:
+							slot = vdev->slot;
+							if(!slot) {pr_err("STATE anomaly: operating vs slot null.\n"); break;}
+							// destroy slot conection
+							spin_lock(&(slot_lock));
+							slot->status = SLOT_FREE;
+							slot->user = NULL;
+							free_slot_num++;
+							vdev->slot = NULL;
+							spin_unlock(&(slot_lock));
+							kfree(vdev);
+							break;
+						default:
+							pr_err("Unknown vdev status: %d.\n",status);
+						}
+						break;
+					}
+					default:
+						pr_err("Unknown event type. This might cause memory leak.\n");
+						break;
+				} //switch
+			} //while
 
 		hw_schedule();
 
@@ -286,6 +364,22 @@ static struct file_operations proc_fops =
 
 static ssize_t dev_open(struct inode *inode, struct file *pfile)
 {
+	struct virtual_dev_t *vdev;
+	// Allocate new virtual device
+
+	vdev = (struct virtual_dev_t*)kmalloc(sizeof(struct virtual_dev_t),GFP_KERNEL);
+	if(!vdev)
+		return -ENOMEM;
+	// initialize virtual_dev
+	init_completion(&(vdev->compl));
+	vdev->marked_for_death = 0;
+	vdev->slot= NULL;
+	vdev->status = DEV_STATUS_BLANK;
+	spin_lock_init(&(vdev->status_lock));
+	INIT_LIST_HEAD(&(vdev->waiter_list));
+
+	pfile->private_data = (void*)vdev;
+
 	try_module_get(THIS_MODULE);
 	return 0;
 }
@@ -299,30 +393,46 @@ static ssize_t dev_open(struct inode *inode, struct file *pfile)
 //  IOCTL_REQUIRE: accel_id
 static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 {
+	struct virtual_dev_t *vdev;
+	int ok=0;
+
+	vdev = (struct virtual_dev_t*)pfile->private_data;
 	switch(cmd)
 	{
 		case IOCTL_RELEASE:
-			if(arg >= SLOT_NUM)
+			// check for status
+			spin_lock(&(vdev->status_lock));
+			if(vdev->status == DEV_STATUS_OPERATING)
 			{
-				// invalid slot number
-				pr_err("Slot id not valid: %ld.\n",arg);
-				return -EPERM;
+				ok = 1;
+				vdev->status = DEV_STATUS_RELEASING;
 			}
-			// check whether process owns the slot
+			else
+				ok = 0;
+			spin_unlock(&(vdev->status_lock));
+			if(!ok) return -ENODEV;
+
+			// check whether virtual device really owns the slot
 			spin_lock(&slot_lock);
-			if(slot_info[arg].user != current)
+			if(vdev->slot==NULL || vdev->slot->user != vdev)
 			{
-				int user_pid = slot_info[arg].user ? slot_info[arg].user->pid : -1;
 				spin_unlock(&slot_lock);
 				// other process owns the slot
-				pr_err("Unauthorized slot acess. Slot user pid: %d, current pid: %d\n",user_pid,current->pid);
+				pr_err("Unauthorized slot access.");
 				return -EPERM;
 			}
-			slot_info[arg].user = NULL;
-			slot_info[arg].status = SLOT_FREE;
+			// delete slot-vdev connection
+			vdev->slot->status = SLOT_FREE;
+			vdev->slot->user = NULL;
+
+			vdev->slot = NULL;
 			free_slot_num++;
 			spin_unlock(&slot_lock);
 
+			// change vdev status back to blank
+			spin_lock(&(vdev->status_lock));
+			vdev->status = DEV_STATUS_BLANK;
+			spin_unlock(&(vdev->status_lock));
 			// notify scheduler thread
 			complete(&event_in);
 			return 0;
@@ -339,9 +449,9 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 				return -EPERM;
 			}
 
-			if(pfile->private_data != NULL)
+			if(pfile->private_data == NULL)
 			{
-				pr_err("Private data is not empty.\n");
+				pr_err("Private data is empty.\n");
 				return -EINVAL;
 			}
 
@@ -351,24 +461,35 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 				pr_err("No memory for request allocation.\n");
 				return -ENOMEM;
 			}
-
 			// initialize request
 			my_request->acc_id = arg;
 			my_request->event_type = EVENT_REQUEST;
-			init_completion(&(my_request->compl));
 			my_request->sender = current;
-			my_request->slot_id = -1;
+			my_request->vdev = (struct virtual_dev_t*)pfile->private_data;
 			INIT_LIST_HEAD(&(my_request->waiter_list));
 
-			pfile->private_data = (void*)my_request;
 
-			// append request to the event list
-			add_event(my_request);
+			// check vdev status
+			spin_lock(&(vdev->status_lock));
+			if(vdev->status == DEV_STATUS_BLANK && vdev->marked_for_death==0)
+			{
+				vdev->status = DEV_STATUS_QUEUED;
+				// append request to the event list
+				add_event(my_request);
+			}
+			else
+			{
+				// close request already given
+				spin_unlock(&(vdev->status_lock));
+				kfree(my_request);
+				return -ENODEV;
+			}
+			spin_unlock(&(vdev->status_lock));
+
 			// wait for load ready
-			wait_for_completion(&(my_request->compl));
+			wait_for_completion_interruptible(&(vdev->compl));
 			// accel loaded
-			slot_id = my_request->slot_id;
-			kfree(my_request);
+			slot_id = vdev->slot - slot_info;
 			return slot_id;
 		}
 			break;
@@ -381,14 +502,57 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 	return 0;
 }
 
+// give status informations
+#define BUFF_LEN 256
+static char buffer[BUFF_LEN];
+static ssize_t dev_read (struct file *pfile, char __user *buff, size_t len, loff_t *ppos)
+{
+	int status;
+	int slot = -1;
+	int acc_id = -1;
+	struct virtual_dev_t *vdev;
+	int data_len;
+	int data_left;
+
+	vdev = (struct virtual_dev_t*)pfile->private_data;
+	if(!vdev) return -ENODEV;
+
+	spin_lock(&(vdev->status_lock));
+	status = vdev->status;
+	if(status == DEV_STATUS_OPERATING)
+	{
+		slot = vdev->slot-slot_info;
+		acc_id = vdev->slot->actual_dev->acc_id;
+	}
+	// create status report
+	data_len = snprintf(buffer,BUFF_LEN,"Status :%d\nSlot: %d\nAcc_id: %d\n",status,slot,acc_id)+1;
+	if(data_len > BUFF_LEN) data_len = BUFF_LEN;
+	data_left = data_len-*ppos;
+	if(data_left > 0)
+		if(copy_to_user(buff,buffer+*ppos,data_left))
+			return -EFAULT;
+	*ppos+= data_left;
+	return data_left;
+}
+
 static int dev_close (struct inode *inode, struct file *pfile)
 {
+	struct virtual_dev_t *vdev;
 	// send event to delete all task related requests from the system
 	struct user_event *e;
+
+	vdev = (struct virtual_dev_t*)pfile->private_data;
+
 	e = (struct user_event*)kmalloc(sizeof(struct user_event),GFP_KERNEL);
 	e->event_type = EVENT_CLOSE;
+	e->vdev = (struct virtual_dev_t*)pfile->private_data;
 	e->sender = current;
+
+	spin_lock(&(vdev->status_lock));
+	vdev->marked_for_death = 1;
 	add_event(e);
+	spin_unlock(&(vdev->status_lock));
+
 	module_put(THIS_MODULE);
 	return 0;
 }
@@ -398,7 +562,8 @@ static struct file_operations dev_fops =
 		.owner = THIS_MODULE,
 		.open = dev_open,
 		.release = dev_close,
-		.unlocked_ioctl = dev_ioctl
+		.unlocked_ioctl = dev_ioctl,
+		.read = dev_read
 };
 
 static int fpga_sched_init(void)
@@ -468,8 +633,7 @@ ssize_t procfile_read(struct file *file, char __user *buffer, size_t bufsize, lo
 	for(i=0;i<SLOT_NUM;i++)
 	{
 		int acc_num = slot_info[i].actual_dev ? slot_info[i].actual_dev->acc_id : -1;
-		int pid = slot_info[i].user ? slot_info[i].user->pid : -1;
-		len += sprintf(log_buf,"slot %d \t status: %d \t accel: %d\t pid: %d\n",i,slot_info[i].status,acc_num,pid);
+		len += sprintf(log_buf,"slot %d \t status: %d \t accel: %d",i,slot_info[i].status,acc_num);
 	}
 	spin_unlock(&slot_lock);
 
