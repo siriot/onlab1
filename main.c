@@ -19,7 +19,7 @@
 #include <linux/mm_types.h>
 #include <linux/proc_fs.h>
 #include <linux/string.h>
-#include <asm-generic/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/device.h>
 #include <linux/of.h>
 
@@ -176,6 +176,7 @@ static void hw_schedule(void)
 		spin_unlock(&slot_lock);
 		return;
 	}
+	pr_info("Scheduling");
 	for(i=0;i<SLOT_NUM;i++)
 		if(slot_info[i].status==SLOT_FREE)
 		{
@@ -198,7 +199,7 @@ static void hw_schedule(void)
 					spin_lock(&(vdev->status_lock));
 					vdev->status = DEV_STATUS_OPERATING;
 					spin_unlock(&(vdev->status_lock));
-					pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user->pid,i,slot_info[i].actual_dev->acc_id);
+					pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user ? vdev->user->pid : -1,i,slot_info[i].actual_dev->acc_id);
 					complete(&(vdev->compl));
 			}
 			else
@@ -229,7 +230,6 @@ static void hw_schedule(void)
 						slot_info[i].user = vdev;
 						free_slot_num--;
 						spin_unlock(&slot_lock);
-
 						spin_lock(&(vdev->status_lock));
 						vdev->status = DEV_STATUS_OPERATING;
 						vdev->slot = &slot_info[i];
@@ -245,7 +245,7 @@ static void hw_schedule(void)
 					}
 
 					// start waiter process
-					pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user->pid,i,d->acc_id);
+					pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user?vdev->user->pid:-1,i,d->acc_id);
 					complete(&(vdev->compl));
 				}
 			}
@@ -269,8 +269,7 @@ static int sched_thread_fn(void *data)
 
 		while((r = get_event()) != NULL)
 			{
-				pr_info("Processing user event: type: %d, accel_num: %d.\n",r->event_type,r->acc_id);
-
+				pr_info("New event.\n");
 				vdev = r->vdev;
 				switch(r->event_type)
 				{
@@ -283,7 +282,7 @@ static int sched_thread_fn(void *data)
 						// free event
 						kfree(r);
 						r=NULL;
-
+						pr_info("Request processed for accel: %d.\n",acc_id);
 						break;
 					}
 					case EVENT_CLOSE:
@@ -327,6 +326,8 @@ static int sched_thread_fn(void *data)
 						default:
 							pr_err("Unknown vdev status: %d.\n",status);
 						}
+
+						pr_info("Virtual device closed.\n");
 						break;
 					}
 					default:
@@ -469,6 +470,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			INIT_LIST_HEAD(&(my_request->waiter_list));
 
 
+			vdev->user = current;
 			// check vdev status
 			spin_lock(&(vdev->status_lock));
 			if(vdev->status == DEV_STATUS_BLANK && vdev->marked_for_death==0)
@@ -482,7 +484,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 				// close request already given
 				spin_unlock(&(vdev->status_lock));
 				kfree(my_request);
-				return -ENODEV;
+				return -EBUSY;
 			}
 			spin_unlock(&(vdev->status_lock));
 
@@ -495,7 +497,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			break;
 		default:
 			pr_err("Unknown ioctl command code: %u.\n",cmd);
-			return -1;
+			return -EPERM;
 			break;
 
 	}
@@ -512,7 +514,6 @@ static ssize_t dev_read (struct file *pfile, char __user *buff, size_t len, loff
 	int acc_id = -1;
 	struct virtual_dev_t *vdev;
 	int data_len;
-	int data_left;
 
 	vdev = (struct virtual_dev_t*)pfile->private_data;
 	if(!vdev) return -ENODEV;
@@ -524,15 +525,17 @@ static ssize_t dev_read (struct file *pfile, char __user *buff, size_t len, loff
 		slot = vdev->slot-slot_info;
 		acc_id = vdev->slot->actual_dev->acc_id;
 	}
+	spin_unlock(&(vdev->status_lock));
 	// create status report
 	data_len = snprintf(buffer,BUFF_LEN,"Status :%d\nSlot: %d\nAcc_id: %d\n",status,slot,acc_id)+1;
 	if(data_len > BUFF_LEN) data_len = BUFF_LEN;
-	data_left = data_len-*ppos;
-	if(data_left > 0)
-		if(copy_to_user(buff,buffer+*ppos,data_left))
-			return -EFAULT;
-	*ppos+= data_left;
-	return data_left;
+
+	if(len > data_len) len = data_len;
+
+
+	if(copy_to_user(buff,buffer,len))
+		return -EFAULT;
+	return len;
 }
 
 static int dev_close (struct inode *inode, struct file *pfile)
@@ -633,7 +636,7 @@ ssize_t procfile_read(struct file *file, char __user *buffer, size_t bufsize, lo
 	for(i=0;i<SLOT_NUM;i++)
 	{
 		int acc_num = slot_info[i].actual_dev ? slot_info[i].actual_dev->acc_id : -1;
-		len += sprintf(log_buf,"slot %d \t status: %d \t accel: %d",i,slot_info[i].status,acc_num);
+		len += sprintf(log_buf,"slot %d \t status: %d \t accel: %d\n",i,slot_info[i].status,acc_num);
 	}
 	spin_unlock(&slot_lock);
 
