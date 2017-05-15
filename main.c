@@ -489,7 +489,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			spin_unlock(&(vdev->status_lock));
 
 			// wait for load ready
-			wait_for_completion_interruptible(&(vdev->compl));
+			wait_for_completion_killable(&(vdev->compl));
 			// accel loaded
 			slot_id = vdev->slot - slot_info;
 			return slot_id;
